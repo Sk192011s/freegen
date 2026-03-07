@@ -62,6 +62,12 @@ function getCSRFSecret(): string {
   return secret;
 }
 
+// ============== SHARED ENCRYPTION SECRET ==============
+// Server and client MUST use the same secret for encrypt/decrypt
+function getPayloadSecret(): string {
+  return Deno.env.get("PAYLOAD_SECRET") || getCSRFSecret();
+}
+
 // ============== CSRF TOKEN ==============
 
 async function generateCSRFToken(ip: string): Promise<string> {
@@ -75,9 +81,12 @@ async function validateCSRFToken(token: string, ip: string): Promise<boolean> {
   if (!token || typeof token !== "string" || token.length !== 64) return false;
   const secret = getCSRFSecret();
   const hour = Math.floor(Date.now() / (1000 * 60 * 60));
-  const current = await hashSHA256(`${ip}||${hour}||csrf||${secret}`);
-  const previous = await hashSHA256(`${ip}||${hour - 1}||csrf||${secret}`);
-  return timingSafeEqual(token, current) || timingSafeEqual(token, previous);
+  // Accept current hour and previous 2 hours (more lenient for slow devices)
+  for (let offset = 0; offset <= 2; offset++) {
+    const expected = await hashSHA256(`${ip}||${hour - offset}||csrf||${secret}`);
+    if (timingSafeEqual(token, expected)) return true;
+  }
+  return false;
 }
 
 function timingSafeEqual(a: string, b: string): boolean {
@@ -93,7 +102,8 @@ function timingSafeEqual(a: string, b: string): boolean {
 
 async function generateChallenge(ip: string): Promise<{ challenge: string; difficulty: number }> {
   const secret = getCSRFSecret();
-  const timestamp = Math.floor(Date.now() / (1000 * 60 * 5));
+  // 10-minute window instead of 5 for slow devices
+  const timestamp = Math.floor(Date.now() / (1000 * 60 * 10));
   const challenge = await hashSHA256(`${ip}||${timestamp}||pow||${secret}`);
   return { challenge, difficulty: 4 };
 }
@@ -103,15 +113,17 @@ async function verifyPoW(ip: string, challenge: string, nonce: string): Promise<
   if (!nonce || typeof nonce !== "string" || nonce.length > 20) return false;
 
   const secret = getCSRFSecret();
-  const timestamp = Math.floor(Date.now() / (1000 * 60 * 5));
-  const expectedChallenge = await hashSHA256(`${ip}||${timestamp}||pow||${secret}`);
-  const prevTimestamp = timestamp - 1;
-  const prevChallenge = await hashSHA256(`${ip}||${prevTimestamp}||pow||${secret}`);
+  const timestamp = Math.floor(Date.now() / (1000 * 60 * 10));
 
-  if (!timingSafeEqual(challenge, expectedChallenge) && !timingSafeEqual(challenge, prevChallenge)) return false;
-
-  const hash = await hashSHA256(`${challenge}||${nonce}`);
-  return hash.startsWith("0000");
+  // Check current and previous two windows for slow devices
+  for (let offset = 0; offset <= 2; offset++) {
+    const expectedChallenge = await hashSHA256(`${ip}||${timestamp - offset}||pow||${secret}`);
+    if (timingSafeEqual(challenge, expectedChallenge)) {
+      const hash = await hashSHA256(`${challenge}||${nonce}`);
+      return hash.startsWith("0000");
+    }
+  }
+  return false;
 }
 
 // ============== FINGERPRINTING ==============
@@ -267,7 +279,7 @@ function getRandomKey(config: ReturnType<typeof getConfig>): { key: string } | n
 }
 
 async function deriveEncryptionKey(): Promise<CryptoKey> {
-  const secret = Deno.env.get("PAYLOAD_SECRET") || getCSRFSecret();
+  const secret = getPayloadSecret();
   const keyMaterial = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(secret),
@@ -524,14 +536,16 @@ function getHTML(): string {
   const safeUserProfile = escapeHTML(config.userProfile);
   const safeAdminNotice = escapeHTML(config.adminNotice);
 
+  // The shared secret for client-side decryption MUST match server-side encryption
+  const payloadSecret = getPayloadSecret();
+  const safePayloadSecret = escapeHTML(payloadSecret);
+
   const noticeHTML = config.adminNotice ? `
     <div class="admin-notice-slider" id="adminNoticeSlider">
       <div class="notice-icon"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div>
       <div class="notice-marquee"><span class="notice-text">${safeAdminNotice}</span></div>
       <button class="notice-close" onclick="closeNotice()">&times;</button>
     </div>` : '';
-
-  const cspNonce = crypto.randomUUID().replace(/-/g, '');
 
   return `<!DOCTYPE html>
 <html lang="my">
@@ -545,9 +559,8 @@ function getHTML(): string {
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Padauk:wght@400;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
 
-  <style nonce="${cspNonce}">
+  <style>
     :root {
-      /* ===== Deep Dark Premium Palette ===== */
       --bg-body: #0b0f1a;
       --bg-body-end: #111827;
       --bg-card: rgba(17, 24, 42, 0.85);
@@ -556,7 +569,6 @@ function getHTML(): string {
       --glass-border: rgba(99, 130, 255, 0.12);
       --glass-highlight: rgba(255, 255, 255, 0.04);
 
-      /* Accent Colors */
       --primary: #818cf8;
       --primary-bright: #a5b4fc;
       --primary-dark: #6366f1;
@@ -571,13 +583,11 @@ function getHTML(): string {
       --rose: #fb7185;
       --rose-dim: #e11d48;
 
-      /* Text */
       --text: #e2e8f0;
       --text-bright: #f8fafc;
       --text-dim: #94a3b8;
       --text-muted: #64748b;
 
-      /* Shadows & Effects */
       --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.3);
       --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35);
       --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.45);
@@ -601,7 +611,6 @@ function getHTML(): string {
       overflow-x: hidden;
     }
 
-    /* ===== Animated Background Orbs ===== */
     .bg-decoration { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 0; pointer-events: none; overflow: hidden; }
     .bg-decoration .shape { position: absolute; border-radius: 50%; filter: blur(100px); animation: floatOrb 20s ease-in-out infinite; }
     .bg-decoration .shape:nth-child(1) { width: 600px; height: 600px; background: radial-gradient(circle, rgba(99,102,241,0.18), rgba(139,92,246,0.08)); top: -250px; left: -200px; animation-duration: 25s; }
@@ -616,7 +625,6 @@ function getHTML(): string {
 
     .container { position: relative; z-index: 1; max-width: 520px; margin: 0 auto; padding: 16px 14px; display: flex; flex-direction: column; min-height: 100vh; }
 
-    /* ===== Admin Notice ===== */
     .admin-notice-slider {
       display: flex; align-items: center; gap: 10px; padding: 10px 14px;
       background: rgba(251, 191, 36, 0.1);
@@ -631,7 +639,6 @@ function getHTML(): string {
     @keyframes marquee { 0% { transform: translateX(0); } 100% { transform: translateX(-100%); } }
     .notice-close { background: none; border: none; font-size: 20px; color: var(--amber); cursor: pointer; opacity: 0.7; flex-shrink: 0; }
 
-    /* ===== Header ===== */
     .header {
       display: flex; align-items: center; justify-content: space-between;
       padding: 14px 18px;
@@ -676,7 +683,6 @@ function getHTML(): string {
     .up-avatar svg { width: 13px; height: 13px; }
     .up-name { font-size: 11px; font-weight: 700; color: var(--primary-bright); font-family: 'Inter', sans-serif; white-space: nowrap; }
 
-    /* ===== Validity Notice ===== */
     .validity-notice {
       padding: 14px 16px;
       background: rgba(34, 211, 238, 0.08);
@@ -701,7 +707,6 @@ function getHTML(): string {
     .validity-expired .vn-icon { background: rgba(251, 113, 133, 0.15) !important; color: var(--rose) !important; }
     .validity-expired .vn-text strong { color: var(--rose) !important; }
 
-    /* ===== Stats Bar ===== */
     .stats-bar { display: flex; gap: 10px; margin-bottom: 16px; overflow-x: auto; scrollbar-width: none; }
     .stats-bar::-webkit-scrollbar { display: none; }
     .stat-card {
@@ -730,7 +735,6 @@ function getHTML(): string {
     .stat-value { font-size: 16px; font-weight: 700; font-family: 'Inter', sans-serif; color: var(--text-bright); }
     .stat-label { font-size: 10px; color: var(--text-muted); margin-top: 2px; }
 
-    /* ===== Main Card ===== */
     .main-card {
       background: var(--bg-card);
       backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
@@ -754,7 +758,6 @@ function getHTML(): string {
     .card-header h2 { font-size: 20px; font-weight: 700; margin-bottom: 4px; color: var(--text-bright); }
     .card-header p { font-size: 13px; color: var(--text-dim); }
 
-    /* ===== Compat Notice ===== */
     .compat-notice {
       padding: 14px 16px;
       background: rgba(129, 140, 248, 0.06);
@@ -772,7 +775,41 @@ function getHTML(): string {
       font-size: 11px; color: var(--emerald); font-weight: 600; font-family: 'Inter', sans-serif;
     }
 
-    /* ===== Generate Button ===== */
+    /* ===== PoW Progress Bar ===== */
+    .pow-status {
+      margin-bottom: 14px;
+      padding: 10px 14px;
+      background: rgba(251, 191, 36, 0.08);
+      border: 1px solid rgba(251, 191, 36, 0.2);
+      border-radius: var(--radius-md);
+      display: none;
+      align-items: center;
+      gap: 10px;
+      font-size: 12px;
+      color: var(--amber);
+      transition: all 0.3s ease;
+    }
+    .pow-status.show { display: flex; }
+    .pow-status.ready {
+      background: rgba(52, 211, 153, 0.08);
+      border-color: rgba(52, 211, 153, 0.2);
+      color: var(--emerald);
+    }
+    .pow-spinner {
+      width: 16px; height: 16px;
+      border: 2px solid rgba(251, 191, 36, 0.3);
+      border-top: 2px solid var(--amber);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      flex-shrink: 0;
+    }
+    .pow-status.ready .pow-spinner {
+      border-color: rgba(52, 211, 153, 0.3);
+      border-top-color: var(--emerald);
+      animation: none;
+      border: 2px solid var(--emerald);
+    }
+
     .generate-btn {
       width: 100%; padding: 15px; border: none; border-radius: 18px;
       background: linear-gradient(135deg, #6366f1, #7c3aed 55%, #8b5cf6);
@@ -799,7 +836,6 @@ function getHTML(): string {
     .spinner { width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.3); border-top: 2px solid white; border-radius: 50%; animation: spin 0.8s linear infinite; display: none; }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* ===== Error Message ===== */
     .error-msg {
       margin-top: 14px; padding: 13px 16px;
       background: rgba(251, 113, 133, 0.1);
@@ -811,7 +847,6 @@ function getHTML(): string {
     .error-msg.show { display: flex; animation: shake 0.4s ease; }
     @keyframes shake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
 
-    /* ===== Result Area ===== */
     .result-area { margin-top: 16px; display: none; }
     .result-area.show { display: block; }
 
@@ -873,7 +908,6 @@ function getHTML(): string {
       box-shadow: 0 4px 15px rgba(99,102,241,0.3);
     }
 
-    /* ===== Info Bars & Footer ===== */
     .info-bars { display: flex; flex-direction: column; gap: 8px; margin-top: 18px; }
     .info-bar {
       padding: 13px 16px;
@@ -913,7 +947,6 @@ function getHTML(): string {
     .footer { text-align: center; padding: 20px 0 10px; font-size: 11px; color: var(--text-muted); }
     .footer a { color: var(--primary); text-decoration: none; }
 
-    /* ===== Modals & Overlays ===== */
     .qr-modal, .success-overlay {
       position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 150;
       display: none; align-items: center; justify-content: center;
@@ -1020,14 +1053,20 @@ function getHTML(): string {
         </div>
       </div>
 
+      <!-- PoW Status Indicator -->
+      <div class="pow-status" id="powStatus">
+        <div class="pow-spinner"></div>
+        <span id="powStatusText">Security verification ပြင်ဆင်နေပါသည်...</span>
+      </div>
+
       <div class="hp-field" aria-hidden="true" tabindex="-1">
         <label for="hpWebsite">Website</label><input type="text" id="hpWebsite" name="website" autocomplete="off" tabindex="-1">
         <label for="hpEmail">Email</label><input type="text" id="hpEmail" name="email" autocomplete="off" tabindex="-1">
       </div>
 
-      <button class="generate-btn" id="generateBtn" type="button">
+      <button class="generate-btn" id="generateBtn" type="button" disabled>
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>
-        <span id="btnText">Generate Key</span>
+        <span id="btnText">ပြင်ဆင်နေသည်...</span>
         <div class="spinner" id="spinner"></div>
       </button>
 
@@ -1070,7 +1109,7 @@ function getHTML(): string {
   <div class="qr-modal" id="qrModal"><div class="qr-modal-content"><h3>QR Code Scan</h3><div class="qr-code-container" id="qrCodeContainer"></div><br><button class="qr-close-btn" id="qrCloseBtn" type="button">ပိတ်မည်</button></div></div>
   <div class="toast" id="toast" role="status">Copy ကူးယူပြီးပါပြီ!</div>
 
-<script nonce="${cspNonce}">
+<script>
 (function() {
   'use strict';
 
@@ -1081,7 +1120,7 @@ function getHTML(): string {
 
   var csrfToken = '', currentKey = '', isGenerating = false;
   var powChallenge = '', powDifficulty = 4, powNonce = '', powReady = false;
-  var PAYLOAD_SECRET = '';
+  var dataAllowed = false, dataWithinPeriod = true;
 
   var generateBtn = document.getElementById('generateBtn');
   var spinner = document.getElementById('spinner');
@@ -1094,6 +1133,8 @@ function getHTML(): string {
   var successOverlay = document.getElementById('successOverlay');
   var qrModal = document.getElementById('qrModal');
   var toast = document.getElementById('toast');
+  var powStatusEl = document.getElementById('powStatus');
+  var powStatusText = document.getElementById('powStatusText');
 
   generateBtn.addEventListener('click', handleGenerate);
   document.getElementById('copyBtn').addEventListener('click', copyKey);
@@ -1107,14 +1148,83 @@ function getHTML(): string {
     if (e.target === successOverlay) successOverlay.classList.remove('show');
   });
 
-  document.addEventListener('DOMContentLoaded', checkRemaining);
-
-  function solvePoW(challenge, difficulty) {
+  // Use Web Worker for PoW to avoid blocking UI on slow devices
+  function solvePoWWorker(challenge, difficulty) {
     return new Promise(function(resolve) {
       var prefix = '';
       for (var d = 0; d < difficulty; d++) prefix += '0';
+
+      // Try Web Worker first (non-blocking)
+      if (typeof Worker !== 'undefined' && typeof Blob !== 'undefined') {
+        try {
+          var workerCode = '(' + function() {
+            self.onmessage = async function(e) {
+              var ch = e.data.challenge;
+              var pf = e.data.prefix;
+              var maxN = 10000000;
+              var enc = new TextEncoder();
+              for (var n = 0; n < maxN; n++) {
+                var data = enc.encode(ch + "||" + n);
+                var hash = await crypto.subtle.digest("SHA-256", data);
+                var arr = new Uint8Array(hash);
+                var hex = "";
+                for (var i = 0; i < arr.length; i++) {
+                  hex += (arr[i] < 16 ? "0" : "") + arr[i].toString(16);
+                }
+                if (hex.substring(0, pf.length) === pf) {
+                  self.postMessage({ found: true, nonce: String(n) });
+                  return;
+                }
+                // Yield every 1000 iterations
+                if (n % 1000 === 0 && n > 0) {
+                  await new Promise(function(r) { setTimeout(r, 0); });
+                }
+              }
+              self.postMessage({ found: false, nonce: null });
+            };
+          }.toString() + ')();';
+
+          var blob = new Blob([workerCode], { type: 'application/javascript' });
+          var workerUrl = URL.createObjectURL(blob);
+          var worker = new Worker(workerUrl);
+
+          var timeout = setTimeout(function() {
+            worker.terminate();
+            URL.revokeObjectURL(workerUrl);
+            // Fallback to main thread
+            solvePoWMainThread(challenge, prefix).then(resolve);
+          }, 60000);
+
+          worker.onmessage = function(e) {
+            clearTimeout(timeout);
+            worker.terminate();
+            URL.revokeObjectURL(workerUrl);
+            resolve(e.data.found ? e.data.nonce : null);
+          };
+
+          worker.onerror = function() {
+            clearTimeout(timeout);
+            worker.terminate();
+            URL.revokeObjectURL(workerUrl);
+            solvePoWMainThread(challenge, prefix).then(resolve);
+          };
+
+          worker.postMessage({ challenge: challenge, prefix: prefix });
+          return;
+        } catch(ex) {
+          // Worker creation failed, fallback
+        }
+      }
+
+      // Fallback: main thread with yielding
+      solvePoWMainThread(challenge, prefix).then(resolve);
+    });
+  }
+
+  function solvePoWMainThread(challenge, prefix) {
+    return new Promise(function(resolve) {
       var nonce = 0;
-      var batchSize = 500;
+      var batchSize = 200; // smaller batches to keep UI responsive
       var maxNonce = 10000000;
 
       function processBatch() {
@@ -1131,7 +1241,7 @@ function getHTML(): string {
           }
           nonce = end;
           if (nonce >= maxNonce) return resolve(null);
-          setTimeout(processBatch, 0);
+          setTimeout(processBatch, 1); // yield to UI
         });
       }
 
@@ -1149,6 +1259,21 @@ function getHTML(): string {
     });
   }
 
+  function updateButtonState() {
+    if (!dataAllowed) {
+      generateBtn.disabled = true;
+      btnText.textContent = dataWithinPeriod ? 'Keyယူခွင့် ကုန်သွားပါပြီ' : 'သက်တမ်းကုန်နေသည်';
+      return;
+    }
+    if (!powReady) {
+      generateBtn.disabled = true;
+      btnText.textContent = 'Security စစ်ဆေးနေသည်...';
+      return;
+    }
+    generateBtn.disabled = false;
+    btnText.textContent = 'Generate Key';
+  }
+
   function checkRemaining() {
     fetch('/api/check', {
       method: 'POST',
@@ -1159,15 +1284,34 @@ function getHTML(): string {
     .then(function(data) {
       csrfToken = data.csrf_token || '';
       powChallenge = data.pow_challenge || '';
+      dataAllowed = !!data.allowed;
+      dataWithinPeriod = !!data.withinPeriod;
 
-      if (powChallenge) {
+      // Show PoW status
+      if (powChallenge && dataAllowed) {
+        powStatusEl.classList.add('show');
+        powStatusEl.classList.remove('ready');
+        powStatusText.textContent = 'Security verification ပြင်ဆင်နေပါသည်...';
         powReady = false;
-        solvePoW(powChallenge, data.pow_difficulty || 4).then(function(n) {
+        updateButtonState();
+
+        solvePoWWorker(powChallenge, data.pow_difficulty || 4).then(function(n) {
           if (n) {
             powNonce = n;
             powReady = true;
+            powStatusEl.classList.add('ready');
+            powStatusText.textContent = 'Security verification အဆင်သင့်ဖြစ်ပါပြီ';
+            // Auto-hide after 3 seconds
+            setTimeout(function() {
+              powStatusEl.classList.remove('show');
+            }, 3000);
+          } else {
+            powStatusText.textContent = 'Security verification မအောင်မြင်ပါ။ Refresh လုပ်ပါ။';
           }
+          updateButtonState();
         });
+      } else {
+        powStatusEl.classList.remove('show');
       }
 
       document.getElementById('validityText').textContent = data.validityText || '';
@@ -1198,19 +1342,21 @@ function getHTML(): string {
         }
       }
 
-      generateBtn.disabled = !data.allowed;
-      btnText.textContent = !data.allowed
-        ? (data.withinPeriod ? 'Keyယူခွင့် ကုန်သွားပါပြီ' : 'သက်တမ်းကုန်နေသည်')
-        : 'Generate Key';
+      updateButtonState();
     })
-    .catch(function() {});
+    .catch(function() {
+      btnText.textContent = 'ချိတ်ဆက်မှု မအောင်မြင်ပါ';
+    });
   }
+
+  // Start checking on page load
+  checkRemaining();
 
   function handleGenerate() {
     if (isGenerating) return;
 
     if (!powReady) {
-      showError('Security check လုပ်နေပါသည်။ ခဏစောင့်ပါ။');
+      showError('Security verification ပြင်ဆင်နေပါသည်။ ခဏစောင့်ပါ။');
       return;
     }
 
@@ -1236,8 +1382,11 @@ function getHTML(): string {
     .then(function(data) {
       if (!data.success) {
         showError(data.message || 'မအောင်မြင်ပါ။');
-        resetButton();
-        checkRemaining();
+        resetBtn(true);
+        // Re-fetch tokens if token/pow expired
+        if (data.error === 'invalid_token' || data.error === 'pow_invalid') {
+          checkRemaining();
+        }
         return;
       }
 
@@ -1260,22 +1409,22 @@ function getHTML(): string {
         successOverlay.classList.add('show');
         setTimeout(function() { successOverlay.classList.remove('show'); }, 2000);
 
+        // Re-fetch to get new tokens and updated remaining count
         checkRemaining();
-        resetButton();
+        resetBtn(false);
       }).catch(function() {
         showError('Decryption မအောင်မြင်ပါ။ Page Refresh လုပ်ပါ။');
-        resetButton();
+        resetBtn(true);
       });
     })
     .catch(function() {
       showError('ချိတ်ဆက်မှု မအောင်မြင်ပါ။');
-      resetButton();
+      resetBtn(true);
     });
   }
 
   function deriveDecryptionKey() {
     var secret = PATGADUU_SHARED_SECRET;
-    var keyMaterial;
     return crypto.subtle.importKey(
       'raw',
       new TextEncoder().encode(secret),
@@ -1283,7 +1432,6 @@ function getHTML(): string {
       false,
       ['deriveKey']
     ).then(function(km) {
-      keyMaterial = km;
       return crypto.subtle.deriveKey(
         {
           name: 'PBKDF2',
@@ -1291,7 +1439,7 @@ function getHTML(): string {
           iterations: 100000,
           hash: 'SHA-256'
         },
-        keyMaterial,
+        km,
         { name: 'AES-GCM', length: 256 },
         false,
         ['decrypt']
@@ -1302,18 +1450,21 @@ function getHTML(): string {
   function showError(msg) {
     errorText.textContent = msg;
     errorMsg.classList.add('show');
-    setTimeout(function() { errorMsg.classList.remove('show'); }, 5000);
+    setTimeout(function() { errorMsg.classList.remove('show'); }, 6000);
   }
 
-  function resetButton() {
+  function resetBtn(immediate) {
     spinner.style.display = 'none';
     isGenerating = false;
-    setTimeout(function() {
-      if (!isGenerating) {
-        generateBtn.disabled = false;
-        btnText.textContent = 'Generate Key';
-      }
-    }, 3000);
+    if (immediate) {
+      updateButtonState();
+    } else {
+      setTimeout(function() {
+        if (!isGenerating) {
+          updateButtonState();
+        }
+      }, 2000);
+    }
   }
 
   function copyKey() {
@@ -1371,7 +1522,7 @@ function getHTML(): string {
     if (el) el.style.display = 'none';
   };
 
-  var PATGADUU_SHARED_SECRET = '${escapeHTML(Deno.env.get("PAYLOAD_CLIENT_SECRET") || "")}';
+  var PATGADUU_SHARED_SECRET = '${safePayloadSecret}';
 
 })();
 </script>
@@ -1398,6 +1549,7 @@ Deno.serve(async (req) => {
       "font-src https://fonts.gstatic.com",
       "img-src 'self' data:",
       "connect-src 'self'",
+      "worker-src blob:",
       "frame-ancestors 'none'",
       "base-uri 'self'",
       "form-action 'self'"
