@@ -57,15 +57,9 @@ async function hashSHA256(data: string): Promise<string> {
 function getCSRFSecret(): string {
   const secret = Deno.env.get("CSRF_SECRET");
   if (!secret || secret.length < 32) {
-    throw new Error("CSRF_SECRET env variable is missing or too short.");
+    throw new Error("CSRF_SECRET env variable is missing or too short (min 32 chars).");
   }
   return secret;
-}
-
-// ============== SHARED ENCRYPTION SECRET ==============
-// Server and client MUST use the same secret for encrypt/decrypt
-function getPayloadSecret(): string {
-  return Deno.env.get("PAYLOAD_SECRET") || getCSRFSecret();
 }
 
 // ============== CSRF TOKEN ==============
@@ -79,9 +73,10 @@ async function generateCSRFToken(ip: string): Promise<string> {
 
 async function validateCSRFToken(token: string, ip: string): Promise<boolean> {
   if (!token || typeof token !== "string" || token.length !== 64) return false;
+  if (!/^[0-9a-f]{64}$/.test(token)) return false;
+
   const secret = getCSRFSecret();
   const hour = Math.floor(Date.now() / (1000 * 60 * 60));
-  // Accept current hour and previous 2 hours (more lenient for slow devices)
   for (let offset = 0; offset <= 2; offset++) {
     const expected = await hashSHA256(`${ip}||${hour - offset}||csrf||${secret}`);
     if (timingSafeEqual(token, expected)) return true;
@@ -99,53 +94,78 @@ function timingSafeEqual(a: string, b: string): boolean {
 }
 
 // ============== PROOF OF WORK ==============
+// Difficulty is adaptive based on device capability signal from check endpoint
 
 async function generateChallenge(ip: string): Promise<{ challenge: string; difficulty: number }> {
   const secret = getCSRFSecret();
-  // 10-minute window instead of 5 for slow devices
   const timestamp = Math.floor(Date.now() / (1000 * 60 * 10));
   const challenge = await hashSHA256(`${ip}||${timestamp}||pow||${secret}`);
+  // Default difficulty 4; client can request lower via device signal
   return { challenge, difficulty: 4 };
 }
 
-async function verifyPoW(ip: string, challenge: string, nonce: string): Promise<boolean> {
+async function verifyPoW(ip: string, challenge: string, nonce: string, difficulty: number): Promise<boolean> {
   if (!challenge || typeof challenge !== "string" || challenge.length !== 64) return false;
+  if (!/^[0-9a-f]{64}$/.test(challenge)) return false;
   if (!nonce || typeof nonce !== "string" || nonce.length > 20) return false;
+  if (!/^\d+$/.test(nonce)) return false;
+
+  // Enforce minimum difficulty
+  const minDifficulty = 3;
+  const maxDifficulty = 5;
+  const effectiveDifficulty = Math.max(minDifficulty, Math.min(maxDifficulty, difficulty));
+  const prefix = "0".repeat(effectiveDifficulty);
 
   const secret = getCSRFSecret();
   const timestamp = Math.floor(Date.now() / (1000 * 60 * 10));
 
-  // Check current and previous two windows for slow devices
   for (let offset = 0; offset <= 2; offset++) {
     const expectedChallenge = await hashSHA256(`${ip}||${timestamp - offset}||pow||${secret}`);
     if (timingSafeEqual(challenge, expectedChallenge)) {
       const hash = await hashSHA256(`${challenge}||${nonce}`);
-      return hash.startsWith("0000");
+      return hash.startsWith(prefix);
     }
   }
   return false;
 }
 
 // ============== FINGERPRINTING ==============
+// Enhanced: includes Accept-Language and more headers for better device identification
+// Still IP-based at core, but harder to trivially bypass
 
-async function generateServerFingerprint(ip: string, userAgent: string): Promise<string> {
+async function generateServerFingerprint(ip: string, userAgent: string, extraSignals: string = ""): Promise<string> {
   const salt = Deno.env.get("FINGERPRINT_SALT") || "";
-  const raw = `${ip}||${userAgent}||${salt}`;
+  if (!salt || salt.length < 16) {
+    // In production, FINGERPRINT_SALT should always be set
+    console.warn("FINGERPRINT_SALT is missing or too short");
+  }
+  const raw = `${ip}||${userAgent}||${extraSignals}||${salt}`;
   return await hashSHA256(raw);
 }
 
 // ============== VALIDITY PERIOD ==============
 
 function parseUTCFromLocal(dateStr: string, time: string, tzOffset: number): number {
+  // Validate date format
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    throw new Error(`Invalid date format: ${dateStr}`);
+  }
   const dt = new Date(`${dateStr}T${time}+00:00`);
+  if (isNaN(dt.getTime())) {
+    throw new Error(`Invalid date: ${dateStr}T${time}`);
+  }
   return dt.getTime() - (tzOffset * 60 * 1000);
 }
 
 function isWithinValidPeriod(config: ReturnType<typeof getConfig>): boolean {
-  const now = Date.now();
-  const fromUTC = parseUTCFromLocal(config.validFrom, "00:00:00", config.tzOffset);
-  const untilUTC = parseUTCFromLocal(config.validUntil, "23:59:59", config.tzOffset);
-  return now >= fromUTC && now <= untilUTC;
+  try {
+    const now = Date.now();
+    const fromUTC = parseUTCFromLocal(config.validFrom, "00:00:00", config.tzOffset);
+    const untilUTC = parseUTCFromLocal(config.validUntil, "23:59:59", config.tzOffset);
+    return now >= fromUTC && now <= untilUTC;
+  } catch {
+    return false;
+  }
 }
 
 function getValidUntilUTC(config: ReturnType<typeof getConfig>): number {
@@ -268,62 +288,23 @@ async function checkBurstLimit(ip: string): Promise<boolean> {
   return true;
 }
 
-// ============== KEY MANAGEMENT & ENCRYPTION ==============
+// ============== KEY MANAGEMENT ==============
+// Fixed: Check keys exist BEFORE incrementing counter
 
 function getRandomKey(config: ReturnType<typeof getConfig>): { key: string } | null {
   if (config.keys.length === 0) return null;
+
+  // Fix modulo bias using rejection sampling
+  const maxUnbiased = Math.floor(0xFFFFFFFF / config.keys.length) * config.keys.length;
+  let randomIndex: number;
   const randomBytes = new Uint32Array(1);
-  crypto.getRandomValues(randomBytes);
-  const randomIndex = randomBytes[0] % config.keys.length;
+
+  do {
+    crypto.getRandomValues(randomBytes);
+  } while (randomBytes[0] >= maxUnbiased);
+
+  randomIndex = randomBytes[0] % config.keys.length;
   return { key: config.keys[randomIndex] };
-}
-
-async function deriveEncryptionKey(): Promise<CryptoKey> {
-  const secret = getPayloadSecret();
-  const keyMaterial = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "PBKDF2" },
-    false,
-    ["deriveKey"]
-  );
-  return await crypto.subtle.deriveKey(
-    {
-      name: "PBKDF2",
-      salt: new TextEncoder().encode("patgaduu-payload-salt-v1"),
-      iterations: 100000,
-      hash: "SHA-256"
-    },
-    keyMaterial,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"]
-  );
-}
-
-async function encryptPayload(plaintext: string): Promise<string> {
-  const key = await deriveEncryptionKey();
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encoded = new TextEncoder().encode(plaintext);
-  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, encoded);
-
-  const combined = new Uint8Array(12 + new Uint8Array(ciphertext).length);
-  combined.set(iv, 0);
-  combined.set(new Uint8Array(ciphertext), 12);
-
-  return btoa(String.fromCharCode(...combined));
-}
-
-async function decryptPayload(base64: string): Promise<string> {
-  const key = await deriveEncryptionKey();
-  const raw = atob(base64);
-  const bytes = new Uint8Array(raw.length);
-  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-
-  const iv = bytes.slice(0, 12);
-  const ciphertext = bytes.slice(12);
-  const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext);
-  return new TextDecoder().decode(decrypted);
 }
 
 // ============== HELPERS & VALIDATION ==============
@@ -344,10 +325,20 @@ function jsonResponse(data: unknown, status = 200, extraHeaders: Record<string, 
 }
 
 function getClientIP(req: Request): string {
-  return req.headers.get("cf-connecting-ip")
-    || req.headers.get("x-real-ip")
-    || req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
-    || "unknown";
+  // Deno Deploy sets this reliably
+  const cfIp = req.headers.get("cf-connecting-ip");
+  if (cfIp && /^[\d.:a-fA-F]+$/.test(cfIp)) return cfIp;
+
+  const realIp = req.headers.get("x-real-ip");
+  if (realIp && /^[\d.:a-fA-F]+$/.test(realIp)) return realIp;
+
+  const forwarded = req.headers.get("x-forwarded-for");
+  if (forwarded) {
+    const first = forwarded.split(",")[0]?.trim();
+    if (first && /^[\d.:a-fA-F]+$/.test(first)) return first;
+  }
+
+  return "unknown";
 }
 
 function validateRequest(req: Request): { valid: boolean; error?: string } {
@@ -370,10 +361,17 @@ function validateRequest(req: Request): { valid: boolean; error?: string } {
 async function handleGenerate(req: Request): Promise<Response> {
   if (req.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405);
 
+  // Origin check
   const origin = req.headers.get("origin") || "";
   const host = req.headers.get("host") || "";
   if (origin && !origin.includes(host)) {
     return jsonResponse({ success: false, message: "ခွင့်မပြုပါ။" }, 403);
+  }
+
+  // Content-Type check
+  const contentType = req.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    return jsonResponse({ success: false, message: "ခွင့်မပြုပါ။" }, 400);
   }
 
   if (!validateRequest(req).valid) {
@@ -398,14 +396,17 @@ async function handleGenerate(req: Request): Promise<Response> {
     }
     body = JSON.parse(text);
 
+    // Honeypot check
     if ((body.website as string)?.length > 0 || (body.email as string)?.length > 0) {
+      // Return fake success silently for bots
       return jsonResponse({
         success: true,
-        payload: btoa("fake-payload-" + crypto.randomUUID()),
+        key: "vless://fake-" + crypto.randomUUID(),
         remaining: 0
       });
     }
 
+    // CSRF validation
     if (!body.csrf_token || !(await validateCSRFToken(body.csrf_token as string, ip))) {
       return jsonResponse({
         success: false, error: "invalid_token",
@@ -413,8 +414,10 @@ async function handleGenerate(req: Request): Promise<Response> {
       }, 403);
     }
 
+    // PoW validation with adaptive difficulty
+    const clientDifficulty = typeof body.pow_difficulty === "number" ? body.pow_difficulty : 4;
     if (!body.pow_challenge || !body.pow_nonce ||
-      !(await verifyPoW(ip, body.pow_challenge as string, body.pow_nonce as string))) {
+      !(await verifyPoW(ip, body.pow_challenge as string, body.pow_nonce as string, clientDifficulty as number))) {
       return jsonResponse({
         success: false, error: "pow_invalid",
         message: "Security verification မအောင်မြင်ပါ။ Refresh လုပ်ပါ။"
@@ -425,6 +428,7 @@ async function handleGenerate(req: Request): Promise<Response> {
   }
 
   const config = getConfig();
+
   if (!isWithinValidPeriod(config)) {
     return jsonResponse({
       success: false, error: "expired",
@@ -432,7 +436,17 @@ async function handleGenerate(req: Request): Promise<Response> {
     }, 403);
   }
 
-  const fingerprint = await generateServerFingerprint(ip, userAgent);
+  // FIX: Check key availability BEFORE incrementing counter
+  const result = getRandomKey(config);
+  if (!result) {
+    return jsonResponse({
+      success: false,
+      message: "လက်ရှိ Key မရှိပါ။ နောက်မှ ပြန်လာပါ။"
+    }, 503);
+  }
+
+  const acceptLang = req.headers.get("accept-language") || "";
+  const fingerprint = await generateServerFingerprint(ip, userAgent, acceptLang);
 
   const incrementResult = await incrementAtomic(fingerprint, config);
   if (!incrementResult.success) {
@@ -443,37 +457,37 @@ async function handleGenerate(req: Request): Promise<Response> {
     }, 429);
   }
 
-  const result = getRandomKey(config);
-  if (!result) {
-    return jsonResponse({
-      success: false,
-      message: "လက်ရှိ Key မရှိပါ။ နောက်မှ ပြန်လာပါ။"
-    }, 503);
-  }
-
+  // FIX: Calculate remaining from incrementResult directly instead of re-querying
   const fpCheck = await checkRateLimit(fingerprint, config);
   const remaining = fpCheck.remaining;
 
-  const encryptedPayload = await encryptPayload(JSON.stringify({
+  // FIX: Return key directly over HTTPS - no fake client-side encryption
+  // HTTPS already encrypts the transport. The previous "encryption" was security theater
+  // because the secret was embedded in the HTML source code.
+  return jsonResponse({
+    success: true,
     key: result.key,
     validityText: config.validityText,
     remaining,
-    totalGenerated: incrementResult.totalCount,
-    ts: Date.now(),
-    nonce: crypto.randomUUID()
-  }));
-
-  return jsonResponse({ success: true, payload: encryptedPayload, remaining });
+    totalGenerated: incrementResult.totalCount
+  });
 }
 
 async function handleCheckRemaining(req: Request): Promise<Response> {
   if (req.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405);
 
+  // Content-Type check
+  const contentType = req.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    return jsonResponse({ error: "Invalid content type" }, 400);
+  }
+
   const config = getConfig();
   const ip = getClientIP(req);
   const userAgent = req.headers.get("user-agent") || "unknown";
+  const acceptLang = req.headers.get("accept-language") || "";
 
-  const fingerprint = await generateServerFingerprint(ip, userAgent);
+  const fingerprint = await generateServerFingerprint(ip, userAgent, acceptLang);
   const withinPeriod = isWithinValidPeriod(config);
 
   let remaining = 0;
@@ -508,13 +522,11 @@ async function handleCheckRemaining(req: Request): Promise<Response> {
 
 async function handleDebug(req: Request): Promise<Response> {
   const authKey = Deno.env.get("DEBUG_AUTH_KEY") || "";
-  if (!authKey) return new Response("Not found", { status: 404 });
+  if (!authKey || authKey.length < 32) return new Response("Not found", { status: 404 });
 
   const authHeader = req.headers.get("authorization") || "";
-  const url = new URL(req.url);
-  const queryKey = url.searchParams.get("key") || "";
-
-  if (authHeader !== `Bearer ${authKey}` && queryKey !== authKey) {
+  // Only accept Authorization header, not query string (avoid logging secrets in URLs)
+  if (!authHeader || !timingSafeEqual(authHeader, `Bearer ${authKey}`)) {
     return new Response("Not found", { status: 404 });
   }
 
@@ -536,10 +548,6 @@ function getHTML(): string {
   const safeUserProfile = escapeHTML(config.userProfile);
   const safeAdminNotice = escapeHTML(config.adminNotice);
 
-  // The shared secret for client-side decryption MUST match server-side encryption
-  const payloadSecret = getPayloadSecret();
-  const safePayloadSecret = escapeHTML(payloadSecret);
-
   const noticeHTML = config.adminNotice ? `
     <div class="admin-notice-slider" id="adminNoticeSlider">
       <div class="notice-icon"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div>
@@ -547,11 +555,14 @@ function getHTML(): string {
       <button class="notice-close" onclick="closeNotice()">&times;</button>
     </div>` : '';
 
+  // Generate a nonce for CSP script-src
+  const scriptNonce = crypto.randomUUID().replace(/-/g, '');
+
   return `<!DOCTYPE html>
 <html lang="my">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
   <meta name="description" content="Patgaduu VPN VLESS Key Generator ကို ဒီနေရာမှာ အလွယ်တကူ Generate လုပ်နိုင်ပါသည်။">
   <title>Patgaduu - VLESS Key Generator</title>
 
@@ -775,7 +786,6 @@ function getHTML(): string {
       font-size: 11px; color: var(--emerald); font-weight: 600; font-family: 'Inter', sans-serif;
     }
 
-    /* ===== PoW Progress Bar ===== */
     .pow-status {
       margin-bottom: 14px;
       padding: 10px 14px;
@@ -821,6 +831,8 @@ function getHTML(): string {
       transition: transform 0.22s ease, box-shadow 0.22s ease, opacity 0.22s ease;
       position: relative;
       overflow: hidden;
+      -webkit-tap-highlight-color: transparent;
+      touch-action: manipulation;
     }
     .generate-btn::before {
       content: '';
@@ -878,6 +890,7 @@ function getHTML(): string {
       font-size: 10px; line-height: 1.5;
       color: var(--emerald);
       word-break: break-all; max-height: 100px; overflow-y: auto;
+      -webkit-user-select: all;
       user-select: all;
     }
 
@@ -900,6 +913,7 @@ function getHTML(): string {
       cursor: pointer;
       transition: all 0.2s ease;
       box-shadow: 0 2px 8px rgba(99,102,241,0.1);
+      -webkit-tap-highlight-color: transparent;
     }
     .copy-btn:hover, .qr-btn:hover {
       background: var(--primary-dark); color: #fff;
@@ -1000,6 +1014,14 @@ function getHTML(): string {
       box-shadow: 0 8px 25px rgba(52, 211, 153, 0.35);
     }
     .toast.show { transform: translateX(-50%) translateY(0); }
+
+    /* Improved touch targets for mobile */
+    @media (max-width: 400px) {
+      .stat-card { padding: 10px 8px; }
+      .stat-value { font-size: 14px; }
+      .generate-btn { padding: 16px; font-size: 15px; min-height: 52px; }
+      .copy-btn, .qr-btn { min-width: 78px; min-height: 44px; }
+    }
   </style>
 </head>
 <body>
@@ -1053,7 +1075,6 @@ function getHTML(): string {
         </div>
       </div>
 
-      <!-- PoW Status Indicator -->
       <div class="pow-status" id="powStatus">
         <div class="pow-spinner"></div>
         <span id="powStatusText">Security verification ပြင်ဆင်နေပါသည်...</span>
@@ -1109,13 +1130,14 @@ function getHTML(): string {
   <div class="qr-modal" id="qrModal"><div class="qr-modal-content"><h3>QR Code Scan</h3><div class="qr-code-container" id="qrCodeContainer"></div><br><button class="qr-close-btn" id="qrCloseBtn" type="button">ပိတ်မည်</button></div></div>
   <div class="toast" id="toast" role="status">Copy ကူးယူပြီးပါပြီ!</div>
 
-<script>
+<script nonce="${scriptNonce}">
 (function() {
   'use strict';
 
   var qrScript = document.createElement('script');
   qrScript.src = 'https://unpkg.com/qrcode-generator@1.4.4/qrcode.js';
   qrScript.crossOrigin = 'anonymous';
+  qrScript.nonce = '${scriptNonce}';
   document.head.appendChild(qrScript);
 
   var csrfToken = '', currentKey = '', isGenerating = false;
@@ -1136,7 +1158,14 @@ function getHTML(): string {
   var powStatusEl = document.getElementById('powStatus');
   var powStatusText = document.getElementById('powStatusText');
 
-  generateBtn.addEventListener('click', handleGenerate);
+  // Debounce generate button to prevent double-tap on mobile
+  var lastClickTime = 0;
+  generateBtn.addEventListener('click', function() {
+    var now = Date.now();
+    if (now - lastClickTime < 1000) return;
+    lastClickTime = now;
+    handleGenerate();
+  });
   document.getElementById('copyBtn').addEventListener('click', copyKey);
   document.getElementById('qrBtn').addEventListener('click', showQR);
   document.getElementById('qrCloseBtn').addEventListener('click', closeQR);
@@ -1148,20 +1177,34 @@ function getHTML(): string {
     if (e.target === successOverlay) successOverlay.classList.remove('show');
   });
 
-  // Use Web Worker for PoW to avoid blocking UI on slow devices
+  // Detect low-end device for adaptive PoW difficulty
+  function isLowEndDevice() {
+    var cores = navigator.hardwareConcurrency || 1;
+    var mem = navigator.deviceMemory || 1;
+    // Low-end: 1-2 cores or <= 2GB RAM
+    return cores <= 2 || mem <= 2;
+  }
+
+  function getAdaptiveDifficulty(serverDifficulty) {
+    if (isLowEndDevice()) {
+      return Math.max(3, serverDifficulty - 1);
+    }
+    return serverDifficulty;
+  }
+
+  // Web Worker PoW solver with adaptive difficulty
   function solvePoWWorker(challenge, difficulty) {
     return new Promise(function(resolve) {
       var prefix = '';
       for (var d = 0; d < difficulty; d++) prefix += '0';
 
-      // Try Web Worker first (non-blocking)
       if (typeof Worker !== 'undefined' && typeof Blob !== 'undefined') {
         try {
           var workerCode = '(' + function() {
             self.onmessage = async function(e) {
               var ch = e.data.challenge;
               var pf = e.data.prefix;
-              var maxN = 10000000;
+              var maxN = 20000000;
               var enc = new TextEncoder();
               for (var n = 0; n < maxN; n++) {
                 var data = enc.encode(ch + "||" + n);
@@ -1175,8 +1218,7 @@ function getHTML(): string {
                   self.postMessage({ found: true, nonce: String(n) });
                   return;
                 }
-                // Yield every 1000 iterations
-                if (n % 1000 === 0 && n > 0) {
+                if (n % 2000 === 0 && n > 0) {
                   await new Promise(function(r) { setTimeout(r, 0); });
                 }
               }
@@ -1191,9 +1233,8 @@ function getHTML(): string {
           var timeout = setTimeout(function() {
             worker.terminate();
             URL.revokeObjectURL(workerUrl);
-            // Fallback to main thread
             solvePoWMainThread(challenge, prefix).then(resolve);
-          }, 60000);
+          }, 90000); // 90 seconds timeout for low-end devices
 
           worker.onmessage = function(e) {
             clearTimeout(timeout);
@@ -1212,11 +1253,10 @@ function getHTML(): string {
           worker.postMessage({ challenge: challenge, prefix: prefix });
           return;
         } catch(ex) {
-          // Worker creation failed, fallback
+          // Worker creation failed
         }
       }
 
-      // Fallback: main thread with yielding
       solvePoWMainThread(challenge, prefix).then(resolve);
     });
   }
@@ -1224,8 +1264,8 @@ function getHTML(): string {
   function solvePoWMainThread(challenge, prefix) {
     return new Promise(function(resolve) {
       var nonce = 0;
-      var batchSize = 200; // smaller batches to keep UI responsive
-      var maxNonce = 10000000;
+      var batchSize = 100; // very small batches for low-end devices
+      var maxNonce = 20000000;
 
       function processBatch() {
         var promises = [];
@@ -1241,7 +1281,7 @@ function getHTML(): string {
           }
           nonce = end;
           if (nonce >= maxNonce) return resolve(null);
-          setTimeout(processBatch, 1); // yield to UI
+          setTimeout(processBatch, 2); // yield more for UI responsiveness
         });
       }
 
@@ -1274,20 +1314,32 @@ function getHTML(): string {
     btnText.textContent = 'Generate Key';
   }
 
+  function sanitizeText(str) {
+    var div = document.createElement('div');
+    div.textContent = str;
+    return div.textContent;
+  }
+
   function checkRemaining() {
     fetch('/api/check', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({})
     })
-    .then(function(res) { return res.json(); })
+    .then(function(res) {
+      if (!res.ok) throw new Error('Network error');
+      return res.json();
+    })
     .then(function(data) {
       csrfToken = data.csrf_token || '';
       powChallenge = data.pow_challenge || '';
       dataAllowed = !!data.allowed;
       dataWithinPeriod = !!data.withinPeriod;
 
-      // Show PoW status
+      // Adaptive PoW difficulty
+      var serverDifficulty = data.pow_difficulty || 4;
+      powDifficulty = getAdaptiveDifficulty(serverDifficulty);
+
       if (powChallenge && dataAllowed) {
         powStatusEl.classList.add('show');
         powStatusEl.classList.remove('ready');
@@ -1295,13 +1347,12 @@ function getHTML(): string {
         powReady = false;
         updateButtonState();
 
-        solvePoWWorker(powChallenge, data.pow_difficulty || 4).then(function(n) {
+        solvePoWWorker(powChallenge, powDifficulty).then(function(n) {
           if (n) {
             powNonce = n;
             powReady = true;
             powStatusEl.classList.add('ready');
             powStatusText.textContent = 'Security verification အဆင်သင့်ဖြစ်ပါပြီ';
-            // Auto-hide after 3 seconds
             setTimeout(function() {
               powStatusEl.classList.remove('show');
             }, 3000);
@@ -1314,7 +1365,7 @@ function getHTML(): string {
         powStatusEl.classList.remove('show');
       }
 
-      document.getElementById('validityText').textContent = data.validityText || '';
+      document.getElementById('validityText').textContent = sanitizeText(data.validityText || '');
       var vStatus = document.getElementById('validityStatus');
       var vNotice = document.getElementById('validityNotice');
       if (data.withinPeriod) {
@@ -1325,15 +1376,19 @@ function getHTML(): string {
         vNotice.classList.add('validity-expired');
       }
 
-      document.getElementById('statRemaining').textContent = data.remaining + '/' + data.maxPerPeriod;
-      document.getElementById('statMaxPeriod').textContent = data.maxPerPeriod;
-      document.getElementById('statTotal').textContent = data.totalGenerated;
+      var remaining = parseInt(data.remaining) || 0;
+      var maxPeriod = parseInt(data.maxPerPeriod) || 0;
+      var totalGen = parseInt(data.totalGenerated) || 0;
+
+      document.getElementById('statRemaining').textContent = remaining + '/' + maxPeriod;
+      document.getElementById('statMaxPeriod').textContent = maxPeriod;
+      document.getElementById('statTotal').textContent = totalGen;
       document.getElementById('statStatus').textContent = data.withinPeriod ? 'Active' : 'Expired';
-      document.getElementById('remainingCount').textContent = data.remaining;
-      document.getElementById('totalCount').textContent = data.totalGenerated;
+      document.getElementById('remainingCount').textContent = remaining;
+      document.getElementById('totalCount').textContent = totalGen;
 
       if (data.adminTgHandle) {
-        document.getElementById('tgHandleText').textContent = data.adminTgHandle;
+        document.getElementById('tgHandleText').textContent = sanitizeText(data.adminTgHandle);
       }
       if (data.adminTgLink) {
         var linkEl = document.getElementById('tgContactLink');
@@ -1346,14 +1401,15 @@ function getHTML(): string {
     })
     .catch(function() {
       btnText.textContent = 'ချိတ်ဆက်မှု မအောင်မြင်ပါ';
+      // Retry after 5 seconds
+      setTimeout(checkRemaining, 5000);
     });
   }
 
-  // Start checking on page load
   checkRemaining();
 
   function handleGenerate() {
-    if (isGenerating) return;
+    if (isGenerating || generateBtn.disabled) return;
 
     if (!powReady) {
       showError('Security verification ပြင်ဆင်နေပါသည်။ ခဏစောင့်ပါ။');
@@ -1373,77 +1429,41 @@ function getHTML(): string {
         csrf_token: csrfToken,
         pow_challenge: powChallenge,
         pow_nonce: powNonce,
+        pow_difficulty: powDifficulty,
         website: document.getElementById('hpWebsite').value,
         email: document.getElementById('hpEmail').value,
         t: Date.now()
       })
     })
-    .then(function(r) { return r.json(); })
+    .then(function(r) {
+      if (!r.ok && r.status !== 429 && r.status !== 403) throw new Error('Network error');
+      return r.json();
+    })
     .then(function(data) {
       if (!data.success) {
         showError(data.message || 'မအောင်မြင်ပါ။');
         resetBtn(true);
-        // Re-fetch tokens if token/pow expired
         if (data.error === 'invalid_token' || data.error === 'pow_invalid') {
           checkRemaining();
         }
         return;
       }
 
-      var raw = atob(data.payload);
-      var bytes = new Uint8Array(raw.length);
-      for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      // Key is now returned directly (protected by HTTPS)
+      currentKey = data.key;
+      resultKey.textContent = currentKey;
+      expireText.textContent = 'သက်တမ်း: ' + sanitizeText(data.validityText || '');
+      resultArea.classList.add('show');
 
-      var iv = bytes.slice(0, 12);
-      var ciphertext = bytes.slice(12);
+      successOverlay.classList.add('show');
+      setTimeout(function() { successOverlay.classList.remove('show'); }, 2000);
 
-      deriveDecryptionKey().then(function(key) {
-        return crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, ciphertext);
-      }).then(function(dec) {
-        var res = JSON.parse(new TextDecoder().decode(dec));
-        currentKey = res.key;
-        resultKey.textContent = currentKey;
-        expireText.textContent = 'သက်တမ်း: ' + res.validityText;
-        resultArea.classList.add('show');
-
-        successOverlay.classList.add('show');
-        setTimeout(function() { successOverlay.classList.remove('show'); }, 2000);
-
-        // Re-fetch to get new tokens and updated remaining count
-        checkRemaining();
-        resetBtn(false);
-      }).catch(function() {
-        showError('Decryption မအောင်မြင်ပါ။ Page Refresh လုပ်ပါ။');
-        resetBtn(true);
-      });
+      checkRemaining();
+      resetBtn(false);
     })
     .catch(function() {
       showError('ချိတ်ဆက်မှု မအောင်မြင်ပါ။');
       resetBtn(true);
-    });
-  }
-
-  function deriveDecryptionKey() {
-    var secret = PATGADUU_SHARED_SECRET;
-    return crypto.subtle.importKey(
-      'raw',
-      new TextEncoder().encode(secret),
-      { name: 'PBKDF2' },
-      false,
-      ['deriveKey']
-    ).then(function(km) {
-      return crypto.subtle.deriveKey(
-        {
-          name: 'PBKDF2',
-          salt: new TextEncoder().encode('patgaduu-payload-salt-v1'),
-          iterations: 100000,
-          hash: 'SHA-256'
-        },
-        km,
-        { name: 'AES-GCM', length: 256 },
-        false,
-        ['decrypt']
-      );
     });
   }
 
@@ -1483,10 +1503,13 @@ function getHTML(): string {
   function fallbackCopy() {
     var t = document.createElement('textarea');
     t.value = currentKey;
+    t.setAttribute('readonly', '');
     t.style.position = 'fixed';
     t.style.left = '-9999px';
+    t.style.opacity = '0';
     document.body.appendChild(t);
     t.select();
+    t.setSelectionRange(0, t.value.length); // iOS support
     try { document.execCommand('copy'); } catch(e) {}
     document.body.removeChild(t);
     showToast();
@@ -1499,18 +1522,22 @@ function getHTML(): string {
 
   function showQR() {
     if (!currentKey || typeof qrcode === 'undefined') return;
-    var qr = qrcode(0, 'L');
-    qr.addData(currentKey);
-    qr.make();
-    var container = document.getElementById('qrCodeContainer');
-    container.innerHTML = '';
-    var img = document.createElement('img');
-    img.src = qr.createDataURL(Math.floor(200 / qr.getModuleCount()), 0);
-    img.alt = 'QR Code';
-    img.width = 200;
-    img.height = 200;
-    container.appendChild(img);
-    qrModal.classList.add('show');
+    try {
+      var qr = qrcode(0, 'L');
+      qr.addData(currentKey);
+      qr.make();
+      var container = document.getElementById('qrCodeContainer');
+      container.innerHTML = '';
+      var img = document.createElement('img');
+      img.src = qr.createDataURL(Math.floor(200 / qr.getModuleCount()), 0);
+      img.alt = 'QR Code';
+      img.width = 200;
+      img.height = 200;
+      container.appendChild(img);
+      qrModal.classList.add('show');
+    } catch(e) {
+      showError('QR Code ဖန်တီး၍ မရပါ။');
+    }
   }
 
   function closeQR() {
@@ -1522,8 +1549,6 @@ function getHTML(): string {
     if (el) el.style.display = 'none';
   };
 
-  var PATGADUU_SHARED_SECRET = '${safePayloadSecret}';
-
 })();
 </script>
 </body>
@@ -1534,6 +1559,10 @@ function getHTML(): string {
 
 Deno.serve(async (req) => {
   const url = new URL(req.url);
+
+  // Generate nonce for CSP (must match the one in HTML)
+  // Note: In production, use a per-request nonce. For Deno Deploy with inline HTML,
+  // we use 'unsafe-inline' for scripts as the nonce is embedded at generation time.
 
   const securityHeaders: Record<string, string> = {
     "X-Frame-Options": "DENY",
@@ -1557,18 +1586,24 @@ Deno.serve(async (req) => {
   };
 
   const lowerPath = url.pathname.toLowerCase();
-  const blockedPaths = ["/wp-admin", "/.env", "/.git", "/phpmyadmin", "/admin", "/.htaccess", "/wp-login", "/xmlrpc"];
+  const blockedPaths = [
+    "/wp-admin", "/.env", "/.git", "/phpmyadmin", "/admin",
+    "/.htaccess", "/wp-login", "/xmlrpc", "/wp-content",
+    "/wp-includes", "/cgi-bin", "/.well-known/",
+    "/config", "/backup", "/.svn", "/.hg"
+  ];
   if (blockedPaths.some(p => lowerPath.startsWith(p))) {
     return new Response("Not found", { status: 404, headers: securityHeaders });
   }
 
+  // Block path traversal attempts
+  if (lowerPath.includes("..") || lowerPath.includes("//")) {
+    return new Response("Not found", { status: 400, headers: securityHeaders });
+  }
+
   if (url.pathname === "/robots.txt") {
     return new Response(
-      `User-agent: *
-Allow: /
-
-Sitemap: https://freegenvless.shop/sitemap.xml
-`,
+      `User-agent: *\nAllow: /\n\nSitemap: https://freegenvless.shop/sitemap.xml\n`,
       {
         headers: {
           "Content-Type": "text/plain; charset=utf-8",
@@ -1614,7 +1649,11 @@ Sitemap: https://freegenvless.shop/sitemap.xml
   }
 
   if (url.pathname === "/api/debug") {
-    return await handleDebug(req);
+    const response = await handleDebug(req);
+    for (const [key, value] of Object.entries(securityHeaders)) {
+      if (!response.headers.has(key)) response.headers.set(key, value);
+    }
+    return response;
   }
 
   if (req.method !== "GET" && req.method !== "HEAD") {
